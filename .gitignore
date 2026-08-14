@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+opal-demo.wav
+.idea/
+.vscode/
+*.swp
+*.swo
