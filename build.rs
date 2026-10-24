@@ -4,7 +4,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-const OPAL_VERSION: &str = "2.0.2";
+const OPAL_VERSION: &str = "3.0.0";
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());

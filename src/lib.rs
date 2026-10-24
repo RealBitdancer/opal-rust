@@ -20,10 +20,19 @@
 //! chip.render(&mut frames);
 //! ```
 //!
-//! Prefer [`Opal::boxed`] when the ~70 KiB chip state should stay off the stack.
+//! Prefer [`Opal::boxed`] when the ~66 KiB chip state should stay off the stack.
 //!
-//! Bank 1, waveforms 4-7, CHA and CHB, and four-operator pairing apply only
-//! while NEW (register 105h bit 0) is set.
+//! While NEW (register 105h bit 0) is clear, writes to the second register array
+//! land in the first (except 105h itself), E0h writes keep only waveforms 0-3,
+//! and a C0h write turns on both speakers. Changing NEW does not touch anything
+//! already set, including a waveform 4-7 written earlier. All 18 channels keep
+//! playing, and four-operator pairs follow register 104h alone.
+//!
+//! [`Opal`] derefs to the raw mirror [`ffi::Opal`], so chip state such as
+//! `chip.op[3].eg_out` reads directly. Safe code cannot write it. The C core
+//! uses several fields unchecked as array indices and shift counts, so a bad
+//! value would be undefined behavior. [`Opal::raw_mut`] gives write access
+//! under an `unsafe` contract.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -33,13 +42,14 @@ use alloc::boxed::Box;
 use core::ffi::c_int;
 use core::fmt;
 use core::mem::MaybeUninit;
+use core::ops::Deref;
 
 /// Bound opal major version (`OPAL_VERSION_MAJOR`).
-pub const VERSION_MAJOR: u32 = 2;
+pub const VERSION_MAJOR: u32 = 3;
 /// Bound opal minor version (`OPAL_VERSION_MINOR`).
 pub const VERSION_MINOR: u32 = 0;
 /// Bound opal patch version (`OPAL_VERSION_PATCH`).
-pub const VERSION_PATCH: u32 = 2;
+pub const VERSION_PATCH: u32 = 0;
 /// Packed opal version: `major * 10000 + minor * 100 + patch` (`OPAL_VERSION`).
 pub const VERSION: u32 = VERSION_MAJOR * 10_000 + VERSION_MINOR * 100 + VERSION_PATCH;
 
@@ -49,9 +59,12 @@ pub const OPL3_SAMPLE_RATE: u32 = 49_716;
 pub const CHANNEL_COUNT: usize = 18;
 /// Number of operators (slots) in an OPL3 instance.
 pub const OPERATOR_COUNT: usize = 36;
-/// Capacity of the buffered register-write queue.
+/// Size of the buffered register-write queue. It holds at most
+/// `WRITE_BUF_SIZE - 1` pending writes.
 pub const WRITE_BUF_SIZE: usize = 4096;
-/// Chip-sample spacing applied between buffered register writes.
+/// Chip samples between queued register writes.
+///
+/// The spacing is an emulator convention, much slower than the chip's bus.
 pub const WRITE_BUF_DELAY: u32 = 2;
 
 /// No operator: an index field with this value reads as silence.
@@ -219,13 +232,13 @@ impl From<StereoSample> for (i16, i16) {
     }
 }
 
-/// Queued register write entry inside the chip write buffer.
+/// One entry in the buffered register-write queue.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WriteBuf {
-    pub time: u64,
-    pub reg: u16,
-    pub data: u8,
+pub struct QueuedWrite {
+    pub due: u64,
+    pub reg_num: u16,
+    pub value: u8,
 }
 
 /// One FM operator, mapping to one OPL3 slot.
@@ -233,41 +246,36 @@ pub struct WriteBuf {
 /// Melodic channel `ch` uses `op[modulator_slot(ch)]` as its modulator and
 /// `op[carrier_slot(ch)]` as its carrier. In 4-op mode the paired channel
 /// contributes slot + 6 and slot + 9. All cross references are indices into
-/// [`Opal::op`] and [`Opal::chan`], so a copied instance is fully self-contained.
+/// [`ffi::Opal::op`] and [`ffi::Opal::chan`], so a copied instance is fully
+/// self-contained.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Operator {
-    pub slot_index: u8,
-    pub chan_index: u8,
-    /// Phase modulation input: an index into [`Opal::op`] whose `out` is read,
-    /// [`MOD_OWN_FB`] for the operator's own feedback, or [`OP_NONE`] for none.
-    pub mod_source: u8,
-    pub phase: u32,
-    pub phase_out: u16,
-    pub phase_reset: bool,
-    pub waveform: u16,
-    pub freq_mult_times2: u16,
     pub envelope_stage: EnvelopeStage,
-    pub envelope_level: u16,
     /// Current total attenuation (envelope + output level + KSL + tremolo)
     /// in 0.1875 dB steps, where 0 is loudest and 511 or more is silence.
     pub eg_out: u16,
-    pub eg_ksl: u8,
-    pub output_level: u16,
-    pub attack_rate: u16,
-    pub decay_rate: u16,
-    pub sustain_level: u16,
-    pub release_rate: u16,
-    pub key_scale_reg: u8,
     /// Nonzero while keyed on: bit 0 is normal key on, bit 1 is rhythm key on.
     pub key: u8,
+    /// Phase modulation input: an index into [`ffi::Opal::op`] whose `out` is read,
+    /// [`MOD_OWN_FB`] for the operator's own feedback, or [`OP_NONE`] for none.
+    pub mod_source: u8,
     pub out: i16,
     pub prev_out: i16,
-    pub fb_mod: i16,
-    pub key_scale_rate: bool,
-    pub sustain_mode: bool,
-    pub tremolo_enable: bool,
-    pub vibrato_enable: bool,
+    pub phase: u32,
+    pub envelope: u16,
+    pub tremolo: u8,
+    pub vibrato: u8,
+    pub sustain_hold: u8,
+    pub key_scale_rate: u8,
+    pub multiple: u8,
+    pub key_scale_level: u8,
+    pub total_level: u8,
+    pub attack_rate: u8,
+    pub decay_rate: u8,
+    pub sustain_level: u8,
+    pub release_rate: u8,
+    pub waveform: u8,
 }
 
 impl Operator {
@@ -293,7 +301,7 @@ impl Operator {
 
 /// A single channel, which can contain two or more operators.
 ///
-/// `op_slot` holds the indices of the channel's operators in [`Opal::op`]
+/// `op_slot` holds the indices of the channel's operators in [`ffi::Opal::op`]
 /// ([`OP_NONE`] when absent). `pair_index` is the physical 4-op partner
 /// (0+3, 1+4, 2+5, and the same on bank 1). Init pre-wires those pairs.
 /// Channels that cannot pair (6-8, 15-17) use [`CH_NONE`]. Whether 4-op is
@@ -303,7 +311,6 @@ impl Operator {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Channel {
     pub op_slot: [u8; 4],
-    pub chan_index: u8,
     /// Physical 4-op partner.
     ///
     /// Pre-wired on capable channels even while [`Self::chan_type`] is
@@ -312,18 +319,17 @@ pub struct Channel {
     pub pair_index: u8,
     pub out_source: [u8; 4],
     pub chan_type: ChannelType,
-    pub freq: u16,
-    pub octave: u16,
-    pub key_scale_number: u16,
-    pub feedback_shift: u16,
-    pub modulation_type: u16,
-    pub alg: u16,
-    pub cha: u16,
-    pub chb: u16,
-    pub chc: u16,
-    pub chd: u16,
     pub left_pan: u16,
     pub right_pan: u16,
+    pub f_number: u16,
+    pub block: u8,
+    pub latched_key_scale_number: u8,
+    pub feedback: u8,
+    pub connection: u8,
+    /// Speaker enables. Bit 0 is the left speaker and bit 1 is the right.
+    /// [`Opal::new`] sets both.
+    pub output_enable: u8,
+    pub algorithm: u8,
 }
 
 impl Channel {
@@ -339,7 +345,7 @@ const CHANNEL_SLOTS: [usize; CHANNEL_COUNT] = [
     0, 1, 2, 6, 7, 8, 12, 13, 14, 18, 19, 20, 24, 25, 26, 30, 31, 32,
 ];
 
-/// Index into [`Opal::op`] of the modulator slot for melodic channel `ch`
+/// Index into [`ffi::Opal::op`] of the modulator slot for melodic channel `ch`
 /// (0 to 8 is bank 0, 9 to 17 is bank 1).
 ///
 /// # Panics
@@ -351,7 +357,7 @@ pub const fn modulator_slot(ch: usize) -> usize {
     CHANNEL_SLOTS[ch]
 }
 
-/// Index into [`Opal::op`] of the carrier slot for melodic channel `ch`.
+/// Index into [`ffi::Opal::op`] of the carrier slot for melodic channel `ch`.
 ///
 /// # Panics
 ///
@@ -364,55 +370,26 @@ pub const fn carrier_slot(ch: usize) -> usize {
 
 /// An emulated OPL3 chip.
 ///
-/// The struct holds no pointers: all internal references are indices, so an
+/// The state holds no pointers: all internal references are indices, so an
 /// instance is a plain value. Clone it, assign it, or relocate it freely. A
 /// clone is a complete save state.
 ///
-/// The struct is about 70 KiB. Prefer [`Opal::boxed`] when keeping it off the
+/// `Opal` derefs to the raw mirror [`ffi::Opal`], so its fields read directly,
+/// as in `chip.op[3].eg_out`. Safe code cannot write them, because the C core
+/// trusts several of them as array indices and shift counts.
+/// [`Opal::raw_mut`] gives write access under an `unsafe` contract.
+///
+/// ```compile_fail
+/// let mut chip = opal::Opal::new(44_100);
+/// chip.op[3].multiple = 20; // error: cannot assign through `Deref`
+/// ```
+///
+/// The struct is about 66 KiB. Prefer [`Opal::boxed`] when keeping it off the
 /// stack matters.
-#[repr(C)]
+#[repr(transparent)]
 #[derive(Clone)]
 pub struct Opal {
-    pub sample_rate: i32,
-    pub sample_accum: i32,
-    pub last_output: [i16; 2],
-    pub curr_output: [i16; 2],
-    pub mix_buff_right: i32,
-    pub chan: [Channel; CHANNEL_COUNT],
-    pub op: [Operator; OPERATOR_COUNT],
-    pub chip_timer: u16,
-    pub tremolo_pos: u8,
-    pub tremolo_level: u8,
-    pub tremolo_shift: u8,
-    pub vib_pos: u8,
-    pub vib_shift: u8,
-    pub eg_timer: u64,
-    pub eg_state: u8,
-    pub eg_add: u8,
-    pub eg_timer_lo: u8,
-    pub eg_timer_rem: u8,
-    pub note_sel: bool,
-    pub opl3_enabled: bool,
-    pub rhythm_mode: bool,
-    pub waveform_select: bool,
-    pub composite_sine_wave: bool,
-    pub noise: u32,
-    pub rm_hh_bit2: u8,
-    pub rm_hh_bit3: u8,
-    pub rm_hh_bit7: u8,
-    pub rm_hh_bit8: u8,
-    pub rm_tc_bit3: u8,
-    pub rm_tc_bit5: u8,
-    pub rhythm_reg: u8,
-    pub timer: [u8; 2],
-    pub timer_control: u8,
-    pub timer_count: [u16; 2],
-    pub status: u8,
-    pub write_buf: [WriteBuf; WRITE_BUF_SIZE],
-    pub write_buf_sample_count: u64,
-    pub write_buf_cur: u32,
-    pub write_buf_last: u32,
-    pub write_buf_last_time: u64,
+    raw: ffi::Opal,
 }
 
 const _: () = {
@@ -420,54 +397,104 @@ const _: () = {
     assert_send_sync::<Opal>();
 };
 
+impl Deref for Opal {
+    type Target = ffi::Opal;
+
+    #[inline]
+    fn deref(&self) -> &ffi::Opal {
+        &self.raw
+    }
+}
+
 impl Opal {
     /// Returns an initialized instance at the given output sample rate in hertz.
     ///
-    /// The chip state is about 70 KiB. For stack-sensitive call sites use
+    /// The chip state is about 66 KiB. For stack-sensitive call sites use
     /// [`Opal::boxed`] instead.
     ///
-    /// A rate of `0` is remapped by the C core to [`OPL3_SAMPLE_RATE`]. Values
-    /// that do not fit in a C `int` are clamped to `c_int::MAX`.
+    /// A rate of `0` selects [`OPL3_SAMPLE_RATE`]. Rates above
+    /// `i32::MAX - OPL3_SAMPLE_RATE as i32` clamp to that limit. A `u32` that
+    /// does not fit in a C `int` is passed as `c_int::MAX`, which the core
+    /// then clamps.
     #[must_use]
     pub fn new(sample_rate_hz: u32) -> Self {
         let mut chip = MaybeUninit::<Self>::uninit();
-        // Safety: opalInit fully initializes the instance.
+        // Safety: Opal is a transparent wrapper, and opalInit fully initializes it.
         unsafe {
-            ffi::opalInit(chip.as_mut_ptr(), c_sample_rate(sample_rate_hz));
+            ffi::opalInit(chip.as_mut_ptr().cast(), c_sample_rate(sample_rate_hz));
             chip.assume_init()
         }
     }
 
     /// Allocates and initializes an instance on the heap.
     ///
-    /// Prefer this over [`Opal::new`] when the ~70 KiB chip state should not
+    /// Prefer this over [`Opal::new`] when the ~66 KiB chip state should not
     /// live on the stack.
     #[must_use]
     pub fn boxed(sample_rate_hz: u32) -> Box<Self> {
         let mut chip = Box::<Self>::new_uninit();
-        // Safety: opalInit fully initializes the instance before assume_init.
+        // Safety: Opal is a transparent wrapper, and opalInit fully initializes
+        // it before assume_init.
         unsafe {
-            ffi::opalInit(chip.as_mut_ptr(), c_sample_rate(sample_rate_hz));
+            ffi::opalInit(chip.as_mut_ptr().cast(), c_sample_rate(sample_rate_hz));
             chip.assume_init()
         }
     }
 
+    /// Returns write access to the raw state.
+    ///
+    /// Reading needs no `unsafe`: `Opal` derefs to [`ffi::Opal`].
+    ///
+    /// # Safety
+    ///
+    /// The C core uses some fields unchecked as array indices, shift counts,
+    /// and factors in 32-bit math. When the borrow ends, the state must still
+    /// have:
+    ///
+    /// - `sample_rate` in `1..=i32::MAX - 49716`
+    /// - `queue_head` below [`WRITE_BUF_SIZE`]
+    /// - each operator's `multiple` below 16
+    /// - each channel's `f_number` below 1024, `block` and `feedback` below 8,
+    ///   `connection` at 0 or 1, and `left_pan` and `right_pan` at most 256
+    /// - every `op_slot`, `pair_index`, and `algorithm` as the core last set it
+    ///
+    /// Other fields may hold any value. Assigning the state of another `Opal`,
+    /// as in `*chip.raw_mut() = (*other).clone()`, is always valid.
+    #[inline]
+    pub unsafe fn raw_mut(&mut self) -> &mut ffi::Opal {
+        &mut self.raw
+    }
+
+    /// Wraps a raw state, such as a copy taken with `(*chip).clone()`.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must meet the conditions listed on [`Opal::raw_mut`]. A copy of
+    /// another instance's state does.
+    #[inline]
+    #[must_use]
+    pub unsafe fn from_raw(raw: ffi::Opal) -> Self {
+        Self { raw }
+    }
+
     /// Changes the output sample rate of an initialized instance.
     ///
-    /// Also resets the output resampler and the buffered-write queue. A rate
-    /// of `0` is remapped by the C core to [`OPL3_SAMPLE_RATE`]. Values that
-    /// do not fit in a C `int` are clamped to `c_int::MAX`.
+    /// A rate of `0` selects [`OPL3_SAMPLE_RATE`]. Rates above
+    /// `i32::MAX - OPL3_SAMPLE_RATE as i32` clamp to that limit. A `u32` that
+    /// does not fit in a C `int` is passed as `c_int::MAX`, which the core
+    /// then clamps. The write queue and the output history stay in place.
+    /// The resampler phase in [`ffi::Opal::sample_accum`] resets to zero.
     #[inline]
     pub fn set_sample_rate(&mut self, sample_rate_hz: u32) {
         // Safety: self is a valid initialized Opal instance.
-        unsafe { ffi::opalSetSampleRate(&raw mut *self, c_sample_rate(sample_rate_hz)) }
+        unsafe { ffi::opalSetSampleRate(&raw mut self.raw, c_sample_rate(sample_rate_hz)) }
     }
 
     /// Writes a register immediately, on the same sample as the call.
     #[inline]
     pub fn write_reg(&mut self, reg: u16, value: u8) {
         // Safety: self is a valid initialized Opal instance.
-        unsafe { ffi::opalWriteReg(&raw mut *self, reg, value) }
+        unsafe { ffi::opalWriteReg(&raw mut self.raw, reg, value) }
     }
 
     /// Writes many registers immediately, in iterator order.
@@ -480,12 +507,16 @@ impl Opal {
 
     /// Queues a register write.
     ///
-    /// Queued writes apply [`WRITE_BUF_DELAY`] chip samples apart, matching
-    /// real chip timing.
+    /// Queued writes land at least [`WRITE_BUF_DELAY`] chip samples apart, so
+    /// a key-off followed by a key-on still restarts the envelope. The spacing
+    /// is an emulator convention, much slower than the chip's bus, so a long
+    /// burst falls behind. A call that finds `WRITE_BUF_SIZE - 1` writes
+    /// pending first applies all of them at once, without the spacing, so a
+    /// key-off and key-on among them do not restart the envelope.
     #[inline]
     pub fn write_reg_buffered(&mut self, reg: u16, value: u8) {
         // Safety: self is a valid initialized Opal instance.
-        unsafe { ffi::opalWriteRegBuffered(&raw mut *self, reg, value) }
+        unsafe { ffi::opalWriteRegBuffered(&raw mut self.raw, reg, value) }
     }
 
     /// Queues many register writes, in iterator order.
@@ -500,16 +531,17 @@ impl Opal {
     #[inline]
     pub fn flush_write_buf(&mut self) {
         // Safety: self is a valid initialized Opal instance.
-        unsafe { ffi::opalFlushWriteBuf(&raw mut *self) }
+        unsafe { ffi::opalFlushWriteBuf(&raw mut self.raw) }
     }
 
     /// Sets the panning level for a channel: 0 left, 64 middle, 127 right.
+    /// Values above 127 clamp to 127.
     ///
     /// `ch` is 0 to 17, or 0 to 8 with bit 8 set for the second bank.
     #[inline]
     pub fn pan(&mut self, ch: u16, level: u8) {
         // Safety: self is a valid initialized Opal instance.
-        unsafe { ffi::opalPan(&raw mut *self, ch, level) }
+        unsafe { ffi::opalPan(&raw mut self.raw, ch, level) }
     }
 
     /// Generates one stereo 16-bit PCM sample.
@@ -519,7 +551,7 @@ impl Opal {
         let mut out = StereoSample::default();
         // Safety: self is valid. Out pointers refer to local storage.
         unsafe {
-            ffi::opalSample(&raw mut *self, &raw mut out.left, &raw mut out.right);
+            ffi::opalSample(&raw mut self.raw, &raw mut out.left, &raw mut out.right);
         }
         out
     }
@@ -538,7 +570,7 @@ impl Opal {
         for frame in frames {
             // Safety: self is valid. Frame elements are distinct mutable slots.
             unsafe {
-                ffi::opalSample(&raw mut *self, &raw mut frame[0], &raw mut frame[1]);
+                ffi::opalSample(&raw mut self.raw, &raw mut frame[0], &raw mut frame[1]);
             }
         }
     }
@@ -552,14 +584,15 @@ impl Opal {
 
     /// Reads the chip status register.
     ///
-    /// Bit 7 is IRQ, bit 6 is timer 1 overflow, bit 5 is timer 2 overflow.
-    /// Flags stay set until a reset write (bit 7 of register 4), as on real
-    /// hardware. See [`STATUS_IRQ`], [`STATUS_TIMER1`], and [`STATUS_TIMER2`].
+    /// Bit 7 is IRQ, bit 6 is timer 1 overflow, and bit 5 is timer 2 overflow.
+    /// A flag stays set until a reset write (bit 7 of register 4) or a write
+    /// that sets that timer's mask bit. A masked timer sets neither its flag
+    /// nor IRQ. See [`STATUS_IRQ`], [`STATUS_TIMER1`], and [`STATUS_TIMER2`].
     #[inline]
     #[must_use]
     pub fn read_status(&self) -> u8 {
         // Safety: opalReadStatus only reads the status byte.
-        unsafe { ffi::opalReadStatus((&raw const *self).cast_mut()) }
+        unsafe { ffi::opalReadStatus((&raw const self.raw).cast_mut()) }
     }
 }
 
@@ -569,21 +602,72 @@ fn c_sample_rate(sample_rate_hz: u32) -> c_int {
 
 impl fmt::Debug for Opal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Opal")
-            .field("sample_rate", &self.sample_rate)
-            .field("opl3_enabled", &self.opl3_enabled)
-            .field("rhythm_mode", &self.rhythm_mode)
-            .field("status", &self.status)
-            .finish_non_exhaustive()
+        fmt::Debug::fmt(&self.raw, f)
     }
 }
 
 /// Raw C API, matching `include/opal/opal.h` one for one.
 ///
-/// Prefer the methods on [`Opal`] unless you need the C surface directly.
+/// Prefer [`crate::Opal`] and its methods unless you need the C surface
+/// directly. Every function except [`opalInit`](ffi::opalInit), which takes
+/// uninitialized memory, requires a state that meets the conditions listed on
+/// [`crate::Opal::raw_mut`].
 pub mod ffi {
-    use super::Opal;
+    use super::{CHANNEL_COUNT, Channel, OPERATOR_COUNT, Operator, QueuedWrite, WRITE_BUF_SIZE};
     use core::ffi::c_int;
+    use core::fmt;
+
+    /// Raw mirror of the C `Opal` struct.
+    ///
+    /// [`crate::Opal`] derefs to this, so every field is readable from safe
+    /// code. Building or editing one is safe too, but it reaches the C core
+    /// only through `unsafe` code: [`crate::Opal::from_raw`],
+    /// [`crate::Opal::raw_mut`], or the functions in this module.
+    #[repr(C)]
+    #[derive(Clone)]
+    pub struct Opal {
+        pub sample_rate: i32,
+        pub sample_accum: i32,
+        pub last_output: [i16; 2],
+        pub curr_output: [i16; 2],
+        pub chan: [Channel; CHANNEL_COUNT],
+        pub op: [Operator; OPERATOR_COUNT],
+        pub timer: [u8; 2],
+        pub timer_control: u8,
+        pub timer_count: [u16; 2],
+        pub status: u8,
+        pub new_mode: u8,
+        pub pair_enable: u8,
+        pub rhythm_mode: u8,
+        pub note_select: u8,
+        pub tremolo_depth: u8,
+        pub vibrato_depth: u8,
+        pub wave_select_enable: u8,
+        pub composite_sine: u8,
+        pub tremolo_position: u8,
+        pub tremolo_level: u8,
+        pub sample_counter: u16,
+        pub hi_hat_phase: u16,
+        pub cymbal_phase: u16,
+        pub noise: u32,
+        pub pending_right: i32,
+        pub chip_samples: u64,
+        pub last_due: u64,
+        pub queue_head: u16,
+        pub queue_count: u16,
+        pub queue: [QueuedWrite; WRITE_BUF_SIZE],
+    }
+
+    impl fmt::Debug for Opal {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Opal")
+                .field("sample_rate", &self.sample_rate)
+                .field("new_mode", &self.new_mode)
+                .field("rhythm_mode", &self.rhythm_mode)
+                .field("status", &self.status)
+                .finish_non_exhaustive()
+        }
+    }
 
     unsafe extern "C" {
         /// Fully initializes `*opal` at `sample_rate` hertz.
@@ -597,50 +681,57 @@ pub mod ffi {
         ///
         /// # Safety
         ///
-        /// `opal` must point to an initialized [`Opal`].
+        /// `opal` must point to an [`Opal`] that meets the conditions listed
+        /// on [`crate::Opal::raw_mut`].
         pub fn opalSetSampleRate(opal: *mut Opal, sample_rate: c_int);
 
         /// Writes a register immediately.
         ///
         /// # Safety
         ///
-        /// `opal` must point to an initialized [`Opal`].
+        /// `opal` must point to an [`Opal`] that meets the conditions listed
+        /// on [`crate::Opal::raw_mut`].
         pub fn opalWriteReg(opal: *mut Opal, reg_num: u16, val: u8);
 
         /// Queues a register write.
         ///
         /// # Safety
         ///
-        /// `opal` must point to an initialized [`Opal`].
+        /// `opal` must point to an [`Opal`] that meets the conditions listed
+        /// on [`crate::Opal::raw_mut`].
         pub fn opalWriteRegBuffered(opal: *mut Opal, reg_num: u16, val: u8);
 
         /// Applies any queued register writes immediately.
         ///
         /// # Safety
         ///
-        /// `opal` must point to an initialized [`Opal`].
+        /// `opal` must point to an [`Opal`] that meets the conditions listed
+        /// on [`crate::Opal::raw_mut`].
         pub fn opalFlushWriteBuf(opal: *mut Opal);
 
         /// Sets per-channel panning.
         ///
         /// # Safety
         ///
-        /// `opal` must point to an initialized [`Opal`].
+        /// `opal` must point to an [`Opal`] that meets the conditions listed
+        /// on [`crate::Opal::raw_mut`].
         pub fn opalPan(opal: *mut Opal, channel: u16, pan: u8);
 
         /// Writes one stereo sample to `left` and `right`.
         ///
         /// # Safety
         ///
-        /// `opal` must point to an initialized [`Opal`]. `left` and `right`
-        /// must be valid for writes.
+        /// `opal` must point to an [`Opal`] that meets the conditions listed
+        /// on [`crate::Opal::raw_mut`]. `left` and `right` must be valid for
+        /// writes.
         pub fn opalSample(opal: *mut Opal, left: *mut i16, right: *mut i16);
 
         /// Reads the status register. The C function takes `*mut` but does not write.
         ///
         /// # Safety
         ///
-        /// `opal` must point to an initialized [`Opal`].
+        /// `opal` must point to an [`Opal`] that meets the conditions listed
+        /// on [`crate::Opal::raw_mut`].
         pub fn opalReadStatus(opal: *mut Opal) -> u8;
     }
 }
@@ -655,10 +746,10 @@ mod tests {
         static opal_abi_sizes: [usize; 4];
         static opal_abi_counts: [usize; 4];
         static opal_abi_version: [c_int; 4];
-        static opal_abi_write_buf_offsets: [usize; 3];
-        static opal_abi_operator_offsets: [usize; 26];
-        static opal_abi_channel_offsets: [usize; 17];
-        static opal_abi_opal_offsets: [usize; 40];
+        static opal_abi_queued_write_offsets: [usize; 3];
+        static opal_abi_operator_offsets: [usize; 20];
+        static opal_abi_channel_offsets: [usize; 13];
+        static opal_abi_opal_offsets: [usize; 30];
     }
 
     #[test]
@@ -667,114 +758,95 @@ mod tests {
         // Safety: symbols are defined by abi_check.c, linked for tests only.
         unsafe {
             assert_eq!(opal_abi_counts[0], 3);
-            assert_eq!(opal_abi_counts[1], 26);
-            assert_eq!(opal_abi_counts[2], 17);
-            assert_eq!(opal_abi_counts[3], 40);
+            assert_eq!(opal_abi_counts[1], 20);
+            assert_eq!(opal_abi_counts[2], 13);
+            assert_eq!(opal_abi_counts[3], 30);
 
-            assert_eq!(size_of::<WriteBuf>(), opal_abi_sizes[0]);
+            assert_eq!(size_of::<QueuedWrite>(), opal_abi_sizes[0]);
             assert_eq!(size_of::<Operator>(), opal_abi_sizes[1]);
             assert_eq!(size_of::<Channel>(), opal_abi_sizes[2]);
+            assert_eq!(size_of::<ffi::Opal>(), opal_abi_sizes[3]);
             assert_eq!(size_of::<Opal>(), opal_abi_sizes[3]);
 
-            let write_buf = [
-                offset_of!(WriteBuf, time),
-                offset_of!(WriteBuf, reg),
-                offset_of!(WriteBuf, data),
+            let queued_write = [
+                offset_of!(QueuedWrite, due),
+                offset_of!(QueuedWrite, reg_num),
+                offset_of!(QueuedWrite, value),
             ];
-            assert_eq!(write_buf, opal_abi_write_buf_offsets);
+            assert_eq!(queued_write, opal_abi_queued_write_offsets);
 
             let operator = [
-                offset_of!(Operator, slot_index),
-                offset_of!(Operator, chan_index),
-                offset_of!(Operator, mod_source),
-                offset_of!(Operator, phase),
-                offset_of!(Operator, phase_out),
-                offset_of!(Operator, phase_reset),
-                offset_of!(Operator, waveform),
-                offset_of!(Operator, freq_mult_times2),
                 offset_of!(Operator, envelope_stage),
-                offset_of!(Operator, envelope_level),
                 offset_of!(Operator, eg_out),
-                offset_of!(Operator, eg_ksl),
-                offset_of!(Operator, output_level),
+                offset_of!(Operator, key),
+                offset_of!(Operator, mod_source),
+                offset_of!(Operator, out),
+                offset_of!(Operator, prev_out),
+                offset_of!(Operator, phase),
+                offset_of!(Operator, envelope),
+                offset_of!(Operator, tremolo),
+                offset_of!(Operator, vibrato),
+                offset_of!(Operator, sustain_hold),
+                offset_of!(Operator, key_scale_rate),
+                offset_of!(Operator, multiple),
+                offset_of!(Operator, key_scale_level),
+                offset_of!(Operator, total_level),
                 offset_of!(Operator, attack_rate),
                 offset_of!(Operator, decay_rate),
                 offset_of!(Operator, sustain_level),
                 offset_of!(Operator, release_rate),
-                offset_of!(Operator, key_scale_reg),
-                offset_of!(Operator, key),
-                offset_of!(Operator, out),
-                offset_of!(Operator, prev_out),
-                offset_of!(Operator, fb_mod),
-                offset_of!(Operator, key_scale_rate),
-                offset_of!(Operator, sustain_mode),
-                offset_of!(Operator, tremolo_enable),
-                offset_of!(Operator, vibrato_enable),
+                offset_of!(Operator, waveform),
             ];
             assert_eq!(operator, opal_abi_operator_offsets);
 
             let channel = [
                 offset_of!(Channel, op_slot),
-                offset_of!(Channel, chan_index),
                 offset_of!(Channel, pair_index),
                 offset_of!(Channel, out_source),
                 offset_of!(Channel, chan_type),
-                offset_of!(Channel, freq),
-                offset_of!(Channel, octave),
-                offset_of!(Channel, key_scale_number),
-                offset_of!(Channel, feedback_shift),
-                offset_of!(Channel, modulation_type),
-                offset_of!(Channel, alg),
-                offset_of!(Channel, cha),
-                offset_of!(Channel, chb),
-                offset_of!(Channel, chc),
-                offset_of!(Channel, chd),
                 offset_of!(Channel, left_pan),
                 offset_of!(Channel, right_pan),
+                offset_of!(Channel, f_number),
+                offset_of!(Channel, block),
+                offset_of!(Channel, latched_key_scale_number),
+                offset_of!(Channel, feedback),
+                offset_of!(Channel, connection),
+                offset_of!(Channel, output_enable),
+                offset_of!(Channel, algorithm),
             ];
             assert_eq!(channel, opal_abi_channel_offsets);
 
             let opal = [
-                offset_of!(Opal, sample_rate),
-                offset_of!(Opal, sample_accum),
-                offset_of!(Opal, last_output),
-                offset_of!(Opal, curr_output),
-                offset_of!(Opal, mix_buff_right),
-                offset_of!(Opal, chan),
-                offset_of!(Opal, op),
-                offset_of!(Opal, chip_timer),
-                offset_of!(Opal, tremolo_pos),
-                offset_of!(Opal, tremolo_level),
-                offset_of!(Opal, tremolo_shift),
-                offset_of!(Opal, vib_pos),
-                offset_of!(Opal, vib_shift),
-                offset_of!(Opal, eg_timer),
-                offset_of!(Opal, eg_state),
-                offset_of!(Opal, eg_add),
-                offset_of!(Opal, eg_timer_lo),
-                offset_of!(Opal, eg_timer_rem),
-                offset_of!(Opal, note_sel),
-                offset_of!(Opal, opl3_enabled),
-                offset_of!(Opal, rhythm_mode),
-                offset_of!(Opal, waveform_select),
-                offset_of!(Opal, composite_sine_wave),
-                offset_of!(Opal, noise),
-                offset_of!(Opal, rm_hh_bit2),
-                offset_of!(Opal, rm_hh_bit3),
-                offset_of!(Opal, rm_hh_bit7),
-                offset_of!(Opal, rm_hh_bit8),
-                offset_of!(Opal, rm_tc_bit3),
-                offset_of!(Opal, rm_tc_bit5),
-                offset_of!(Opal, rhythm_reg),
-                offset_of!(Opal, timer),
-                offset_of!(Opal, timer_control),
-                offset_of!(Opal, timer_count),
-                offset_of!(Opal, status),
-                offset_of!(Opal, write_buf),
-                offset_of!(Opal, write_buf_sample_count),
-                offset_of!(Opal, write_buf_cur),
-                offset_of!(Opal, write_buf_last),
-                offset_of!(Opal, write_buf_last_time),
+                offset_of!(ffi::Opal, sample_rate),
+                offset_of!(ffi::Opal, sample_accum),
+                offset_of!(ffi::Opal, last_output),
+                offset_of!(ffi::Opal, curr_output),
+                offset_of!(ffi::Opal, chan),
+                offset_of!(ffi::Opal, op),
+                offset_of!(ffi::Opal, timer),
+                offset_of!(ffi::Opal, timer_control),
+                offset_of!(ffi::Opal, timer_count),
+                offset_of!(ffi::Opal, status),
+                offset_of!(ffi::Opal, new_mode),
+                offset_of!(ffi::Opal, pair_enable),
+                offset_of!(ffi::Opal, rhythm_mode),
+                offset_of!(ffi::Opal, note_select),
+                offset_of!(ffi::Opal, tremolo_depth),
+                offset_of!(ffi::Opal, vibrato_depth),
+                offset_of!(ffi::Opal, wave_select_enable),
+                offset_of!(ffi::Opal, composite_sine),
+                offset_of!(ffi::Opal, tremolo_position),
+                offset_of!(ffi::Opal, tremolo_level),
+                offset_of!(ffi::Opal, sample_counter),
+                offset_of!(ffi::Opal, hi_hat_phase),
+                offset_of!(ffi::Opal, cymbal_phase),
+                offset_of!(ffi::Opal, noise),
+                offset_of!(ffi::Opal, pending_right),
+                offset_of!(ffi::Opal, chip_samples),
+                offset_of!(ffi::Opal, last_due),
+                offset_of!(ffi::Opal, queue_head),
+                offset_of!(ffi::Opal, queue_count),
+                offset_of!(ffi::Opal, queue),
             ];
             assert_eq!(opal, opal_abi_opal_offsets);
         }
@@ -789,10 +861,10 @@ mod tests {
             assert_eq!(opal_abi_version[2], VERSION_PATCH as c_int);
             assert_eq!(opal_abi_version[3], VERSION as c_int);
         }
-        assert_eq!(VERSION_MAJOR, 2);
+        assert_eq!(VERSION_MAJOR, 3);
         assert_eq!(VERSION_MINOR, 0);
-        assert_eq!(VERSION_PATCH, 2);
-        assert_eq!(VERSION, 20_002);
+        assert_eq!(VERSION_PATCH, 0);
+        assert_eq!(VERSION, 30_000);
     }
 
     const TEST_VOICE: &[(u16, u8)] = &[
@@ -811,12 +883,16 @@ mod tests {
     ];
 
     fn channel_energy(frames: &[i16]) -> (u64, u64) {
-        frames.chunks_exact(2).fold((0, 0), |(left, right), frame| {
-            (
-                left + u64::from(frame[0].unsigned_abs()),
-                right + u64::from(frame[1].unsigned_abs()),
-            )
-        })
+        frames
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .fold((0, 0), |(left, right), frame| {
+                (
+                    left + u64::from(frame[0].unsigned_abs()),
+                    right + u64::from(frame[1].unsigned_abs()),
+                )
+            })
     }
 
     #[test]
@@ -828,6 +904,7 @@ mod tests {
         for ch in &chip.chan {
             assert_eq!(ch.chan_type, ChannelType::TWO_OP);
             assert!(!ch.is_paired());
+            assert_eq!(ch.output_enable, 3);
         }
         for op in &chip.op {
             assert!(!op.is_keyed_on());
@@ -848,11 +925,14 @@ mod tests {
     }
 
     #[test]
-    fn disabling_4op_leaves_pair_index_in_place() {
+    fn four_operator_pairing_follows_register_104h_alone() {
         let mut chip = Opal::new(OPL3_SAMPLE_RATE);
+
         chip.write_reg(0x105, 0x01);
         chip.write_reg(0x104, 0x01);
 
+        assert_eq!(chip.new_mode, 1);
+        assert_eq!(chip.pair_enable, 1);
         assert_eq!(chip.chan[0].chan_type, ChannelType::FOUR_OP);
         assert_eq!(chip.chan[3].chan_type, ChannelType::FOUR_OP2);
         assert_eq!(chip.chan[0].pair_index, 3);
@@ -860,8 +940,27 @@ mod tests {
         assert!(chip.chan[0].is_paired());
         assert!(chip.chan[3].is_paired());
         assert!(!chip.chan[1].is_paired());
+        let paired0 = chip.chan[0];
+        let paired3 = chip.chan[3];
+
+        chip.write_reg(0x105, 0x00);
+        assert_eq!(chip.new_mode, 0);
+        assert_eq!(chip.chan[0].chan_type, ChannelType::FOUR_OP);
+        assert_eq!(chip.chan[3].chan_type, ChannelType::FOUR_OP2);
+        assert_eq!(chip.chan[0].pair_index, 3);
+        assert_eq!(chip.chan[3].pair_index, 0);
+
+        chip.write_reg(0xC0, 0x00);
+        assert_eq!(chip.chan[0], paired0);
+        assert_eq!(chip.chan[3], paired3);
 
         chip.write_reg(0x104, 0x00);
+        assert_eq!(chip.pair_enable, 1);
+        assert_eq!(chip.chan[0].chan_type, ChannelType::FOUR_OP);
+
+        chip.write_reg(0x105, 0x01);
+        chip.write_reg(0x104, 0x00);
+        assert_eq!(chip.pair_enable, 0);
         assert_eq!(chip.chan[0].chan_type, ChannelType::TWO_OP);
         assert_eq!(chip.chan[3].chan_type, ChannelType::TWO_OP);
         assert_eq!(chip.chan[0].pair_index, 3);
@@ -871,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn new_off_keeps_bank_1_silent_and_preserves_cha() {
+    fn clearing_new_leaves_bank_1_playing() {
         let mut chip = Opal::boxed(OPL3_SAMPLE_RATE);
         let bank1_voice = [
             (0x105, 0x01),
@@ -889,9 +988,8 @@ mod tests {
         ];
         chip.write_regs(bank1_voice);
 
-        assert!(chip.opl3_enabled);
-        assert_eq!(chip.chan[9].cha, 0xFFFF);
-        assert_eq!(chip.chan[9].chb, 0xFFFF);
+        assert_eq!(chip.new_mode, 1);
+        assert_eq!(chip.op[modulator_slot(9)].multiple, 1);
 
         let mut frames = [0i16; 4096];
         chip.render(&mut frames);
@@ -899,55 +997,92 @@ mod tests {
         assert!(peak_on > 1000, "peak_on was {peak_on}");
 
         chip.write_reg(0x105, 0x00);
-        assert!(!chip.opl3_enabled);
-        assert_eq!(chip.chan[9].cha, 0xFFFF);
-        assert_eq!(chip.chan[9].chb, 0xFFFF);
+        assert_eq!(chip.new_mode, 0);
+        assert_eq!(chip.op[modulator_slot(9)].multiple, 1);
+        assert_eq!(chip.chan[9].output_enable, 3);
 
         chip.render(&mut frames);
         chip.render(&mut frames);
         let peak_off = frames.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-        assert_eq!(peak_off, 0);
-
-        chip.write_reg(0x105, 0x01);
-        chip.render(&mut frames);
-        let peak_back = frames.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-        assert!(peak_back > 1000, "peak_back was {peak_back}");
+        assert!(peak_off > 1000, "peak_off was {peak_off}");
     }
 
     #[test]
-    fn enabling_opl3_without_writing_c0_is_silent() {
+    fn bank_1_writes_land_in_bank_0_while_new_is_clear() {
+        let mut chip = Opal::new(OPL3_SAMPLE_RATE);
+        chip.write_reg(0x120, 0x0F);
+        assert_eq!(chip.new_mode, 0);
+        assert_eq!(chip.op[0].multiple, 0x0F);
+        assert_eq!(chip.op[modulator_slot(9)].multiple, 0);
+
+        chip.write_reg(0x105, 0x01);
+        assert_eq!(chip.op[0].multiple, 0x0F);
+        chip.write_reg(0x120, 0x03);
+        assert_eq!(chip.op[0].multiple, 0x0F);
+        assert_eq!(chip.op[modulator_slot(9)].multiple, 3);
+    }
+
+    #[test]
+    fn a_voice_is_audible_without_a_c0_write() {
         let mut chip = Opal::boxed(OPL3_SAMPLE_RATE);
         chip.write_regs(TEST_VOICE.iter().copied().filter(|&(reg, _)| reg != 0xC0));
 
-        assert!(chip.opl3_enabled);
-        assert_eq!(chip.chan[0].cha, 0);
-        assert_eq!(chip.chan[0].chb, 0);
+        assert_eq!(chip.new_mode, 1);
+        assert_eq!(chip.chan[0].output_enable, 3);
 
         let mut frames = [0i16; 4096];
         chip.render(&mut frames);
-        assert!(frames.iter().all(|&s| s == 0));
+        let peak = frames.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(peak > 1000, "peak was {peak}");
     }
 
     #[test]
-    fn waveform_4_is_stored_while_new_is_clear() {
+    fn c0_speaker_bits_apply_at_write_time() {
         let mut chip = Opal::new(OPL3_SAMPLE_RATE);
-        chip.write_reg(0xE0, 0x04);
-        assert_eq!(chip.op[0].waveform, 4);
-        assert!(!chip.opl3_enabled);
+        chip.write_reg(0xC0, 0x10);
+        assert_eq!(chip.new_mode, 0);
+        assert_eq!(chip.chan[0].output_enable, 3);
+
+        chip.write_reg(0x105, 0x01);
+        assert_eq!(chip.chan[0].output_enable, 3);
+        chip.write_reg(0xC0, 0x10);
+        assert_eq!(chip.chan[0].output_enable, 1);
+
+        chip.write_reg(0x105, 0x00);
+        assert_eq!(chip.chan[0].output_enable, 1);
     }
 
     #[test]
-    fn masked_timer_overflow_still_sets_the_timer_flag() {
+    fn waveforms_above_3_are_stored_only_while_new_is_set() {
+        let mut chip = Opal::new(OPL3_SAMPLE_RATE);
+        chip.write_reg(0xE0, 0x07);
+        assert_eq!(chip.new_mode, 0);
+        assert_eq!(chip.op[0].waveform, 3);
+
+        chip.write_reg(0x105, 0x01);
+        assert_eq!(chip.op[0].waveform, 3);
+        chip.write_reg(0xE0, 0x07);
+        assert_eq!(chip.op[0].waveform, 7);
+
+        chip.write_reg(0x105, 0x00);
+        assert_eq!(chip.op[0].waveform, 7);
+    }
+
+    #[test]
+    fn a_masked_timer_sets_nothing_and_a_mask_clears_a_raised_flag() {
         let mut chip = Opal::new(OPL3_SAMPLE_RATE);
         chip.write_reg(0x02, 0xFF);
-        chip.write_reg(0x04, 0x41);
+        chip.write_reg(0x04, 0x01);
 
         let mut frames = [0i16; 32];
         chip.render(&mut frames);
+        assert_eq!(chip.read_status(), 0xC0);
 
-        let status = chip.read_status();
-        assert_eq!(status & 0x40, 0x40);
-        assert_eq!(status & 0x80, 0);
+        chip.write_reg(0x04, 0x41);
+        assert_eq!(chip.read_status(), 0);
+
+        chip.render(&mut frames);
+        assert_eq!(chip.read_status(), 0);
     }
 
     #[test]
@@ -988,6 +1123,23 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_copy_wraps_back_into_a_working_chip() {
+        let mut chip = Opal::boxed(OPL3_SAMPLE_RATE);
+        chip.write_regs(TEST_VOICE.iter().copied());
+        let mut warmup = [0i16; 2048];
+        chip.render(&mut warmup);
+
+        let raw: ffi::Opal = (**chip).clone();
+        // Safety: raw is a copy of a live instance's state.
+        let mut copy = Box::new(unsafe { Opal::from_raw(raw) });
+        let mut original_frames = [0i16; 2048];
+        let mut copy_frames = [0i16; 2048];
+        chip.render(&mut original_frames);
+        copy.render(&mut copy_frames);
+        assert_eq!(original_frames, copy_frames);
+    }
+
+    #[test]
     fn buffered_writes_match_immediate_writes_after_flush() {
         let mut immediate = Opal::boxed(OPL3_SAMPLE_RATE);
         let mut buffered = Opal::boxed(OPL3_SAMPLE_RATE);
@@ -1004,11 +1156,30 @@ mod tests {
     }
 
     #[test]
+    fn set_sample_rate_keeps_queued_writes() {
+        let mut chip = Opal::new(OPL3_SAMPLE_RATE);
+        chip.write_reg_buffered(0x20, 0x21);
+        assert_eq!(chip.queue_count, 1);
+        assert_eq!(chip.op[0].multiple, 0);
+
+        chip.set_sample_rate(48_000);
+        assert_eq!(chip.sample_rate, 48_000);
+        assert_eq!(chip.queue_count, 1);
+        assert_eq!(chip.op[0].multiple, 0);
+
+        chip.flush_write_buf();
+        assert_eq!(chip.queue_count, 0);
+        assert_eq!(chip.op[0].multiple, 1);
+    }
+
+    #[test]
     fn resampler_interpolates_a_full_scale_step_without_overflowing() {
         let mut chip = Opal::boxed(44_100);
-        chip.sample_accum = 35281;
-        chip.last_output = [8734, -8734];
-        chip.curr_output = [-32768, 32767];
+        // Safety: the core uses none of these fields as an index or a shift.
+        let raw = unsafe { chip.raw_mut() };
+        raw.sample_accum = 35281;
+        raw.last_output = [8734, -8734];
+        raw.curr_output = [-32768, 32767];
 
         let s = chip.sample();
         assert_eq!(s.left, -24468);
@@ -1038,6 +1209,19 @@ mod tests {
             hard_right_r > hard_right_l * 4,
             "left={hard_right_l} right={hard_right_r}"
         );
+    }
+
+    #[test]
+    fn pan_clamps_levels_above_127() {
+        let mut chip = Opal::new(OPL3_SAMPLE_RATE);
+        chip.pan(0, 127);
+        let left = chip.chan[0].left_pan;
+        let right = chip.chan[0].right_pan;
+        assert!(left < right);
+
+        chip.pan(0, 255);
+        assert_eq!(chip.chan[0].left_pan, left);
+        assert_eq!(chip.chan[0].right_pan, right);
     }
 
     #[test]
@@ -1073,9 +1257,15 @@ mod tests {
     }
 
     #[test]
-    fn sample_rate_too_large_does_not_wrap_negative() {
-        let chip = Opal::new(u32::MAX);
-        assert!(chip.sample_rate > 0);
-        assert_eq!(chip.sample_rate, i32::MAX);
+    fn sample_rate_above_the_core_limit_clamps() {
+        let limit = i32::MAX - OPL3_SAMPLE_RATE as i32;
+        let mut chip = Opal::new(limit as u32);
+        assert_eq!(chip.sample_rate, limit);
+
+        chip.set_sample_rate(limit as u32 + 1);
+        assert_eq!(chip.sample_rate, limit);
+
+        chip = Opal::new(u32::MAX);
+        assert_eq!(chip.sample_rate, limit);
     }
 }
